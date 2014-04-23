@@ -57,7 +57,7 @@ set cpo&vim
 
 let s:plug_source = 'https://raw.github.com/junegunn/vim-plug/master/plug.vim'
 let s:plug_file = 'Plugfile'
-let s:plug_win = 0
+let s:plug_buf = -1
 let s:is_win = has('win32') || has('win64')
 let s:me = expand('<sfile>:p')
 
@@ -70,7 +70,7 @@ function! plug#begin(...)
     let home = s:path(split(&rtp, ',')[0]) . '/plugged'
   else
     echoerr "Unable to determine plug home. Try calling plug#begin() with a path argument."
-    return
+    return 0
   endif
 
   if !isdirectory(home)
@@ -88,6 +88,8 @@ function! plug#begin(...)
 
   let g:plug_home = home
   let g:plugs = {}
+  " we want to keep track of the order plugins where registered.
+  let g:plugs_order = []
 
   command! -nargs=+ Plug        call s:add(1, <args>)
   command! -nargs=* PlugInstall call s:install(<f-args>)
@@ -95,6 +97,7 @@ function! plug#begin(...)
   command! -nargs=0 -bang PlugClean call s:clean('<bang>' == '!')
   command! -nargs=0 PlugUpgrade if s:upgrade() | execute "source ". s:me | endif
   command! -nargs=0 PlugStatus  call s:status()
+  command! -nargs=0 PlugDiff    call s:diff()
 
   return 1
 endfunction
@@ -110,7 +113,12 @@ function! plug#end()
   endwhile
 
   filetype off
-  for plug in values(g:plugs)
+  " we want to make sure the plugin directories are added to rtp in the same
+  " order that they are registered with the Plug command. since the s:add_rtp
+  " function uses ^= to add plugin directories to the front of the rtp, we
+  " need to loop through the plugins in reverse
+  for name in reverse(copy(g:plugs_order))
+    let plug = g:plugs[name]
     if has_key(plug, 'on')
       let commands = type(plug.on) == 1 ? [plug.on] : plug.on
       for cmd in commands
@@ -144,10 +152,14 @@ function! s:rtp(spec)
   return rtp
 endfunction
 
+function! s:esc(path)
+  return substitute(a:path, ' ', '\\ ', 'g')
+endfunction
+
 function! s:add_rtp(rtp)
-  execute "set rtp^=".a:rtp
+  execute "set rtp^=".s:esc(a:rtp)
   if isdirectory(a:rtp.'after')
-    execute "set rtp+=".a:rtp.'after'
+    execute "set rtp+=".s:esc(a:rtp.'after')
   endif
 endfunction
 
@@ -217,6 +229,7 @@ function! s:add(...)
   let dir  = s:dirpath( fnamemodify(join([g:plug_home, name], '/'), ':p') )
   let spec = extend(opts, { 'dir': dir, 'uri': uri })
   let g:plugs[name] = spec
+  let g:plugs_order += [name]
 endfunction
 
 function! s:install(...)
@@ -241,13 +254,16 @@ endfunction
 
 function! s:syntax()
   syntax clear
-  syntax region plug1 start=/\%1l/ end=/\%2l/ contains=ALL
-  syntax region plug2 start=/\%2l/ end=/\%3l/ contains=ALL
-  syn match plugNumber /[0-9]\+[0-9.]*/ containedin=plug1 contained
-  syn match plugBracket /[[\]]/ containedin=plug2 contained
-  syn match plugX /x/ containedin=plug2 contained
+  syntax region plug1 start=/\%1l/ end=/\%2l/ contains=plugNumber
+  syntax region plug2 start=/\%2l/ end=/\%3l/ contains=plugBracket,plugX
+  syn match plugNumber /[0-9]\+[0-9.]*/ contained
+  syn match plugBracket /[[\]]/ contained
+  syn match plugX /x/ contained
   syn match plugDash /^-/
   syn match plugName /\(^- \)\@<=[^:]*/
+  syn match plugCommit /^  [0-9a-z]\{7} .*/ contains=plugRelDate,plugSha
+  syn match plugSha /\(^  \)\@<=[0-9a-z]\{7}/ contained
+  syn match plugRelDate /([^)]*)$/ contained
   syn match plugError /^x.*/
   syn keyword Function PlugInstall PlugStatus PlugUpdate PlugClean
   hi def link plug1       Title
@@ -258,6 +274,8 @@ function! s:syntax()
   hi def link plugDash    Special
   hi def link plugName    Label
   hi def link plugError   Error
+  hi def link plugRelDate Comment
+  hi def link plugSha     Identifier
 endfunction
 
 function! s:lpad(str, len)
@@ -270,16 +288,27 @@ function! s:lastline(msg)
 endfunction
 
 function! s:prepare()
-  execute s:plug_win . 'wincmd w'
-  if exists('b:plug')
-    %d
+  if bufexists(s:plug_buf)
+    let winnr = bufwinnr(s:plug_buf)
+    if winnr < 0
+      vertical topleft new
+      execute 'buffer ' . s:plug_buf
+    else
+      execute winnr . 'wincmd w'
+    endif
+    silent %d _
   else
     vertical topleft new
-    noremap <silent> <buffer> q :q<cr>
-    let b:plug = 1
-    let s:plug_win = winnr()
+    nnoremap <silent> <buffer> q  :if b:plug_preview==1<bar>pc<bar>endif<bar>q<cr>
+    nnoremap <silent> <buffer> D  :PlugDiff<cr>
+    nnoremap <silent> <buffer> S  :PlugStatus<cr>
+    nnoremap <silent> <buffer> ]] :silent! call <SID>section('')<cr>
+    nnoremap <silent> <buffer> [[ :silent! call <SID>section('b')<cr>
+    let b:plug_preview = -1
+    let s:plug_buf = winbufnr(0)
     call s:assign_name()
   endif
+  silent! unmap <buffer> <cr>
   setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile nowrap cursorline
   setf vim-plug
   call s:syntax()
@@ -297,13 +326,17 @@ function! s:assign_name()
   silent! execute "f ".fnameescape(name)
 endfunction
 
-function! s:finish()
+function! s:finish(pull)
   call append(3, '- Finishing ... ')
   redraw
   call s:apply()
   call s:syntax()
   call setline(4, getline(4) . 'Done!')
   normal! gg
+  redraw
+  if a:pull
+    echo "Press 'D' to see the updated changes."
+  endif
 endfunction
 
 function! s:update_impl(pull, args)
@@ -320,7 +353,7 @@ function! s:update_impl(pull, args)
   else
     call s:update_serial(a:pull)
   endif
-  call s:finish()
+  call s:finish(a:pull)
 endfunction
 
 function! s:extend(names)
@@ -330,7 +363,7 @@ function! s:extend(names)
     for name in a:names
       let plugfile = s:rtp(g:plugs[name]) . s:plug_file
       if filereadable(plugfile)
-        execute "source ". plugfile
+        execute "source ". s:esc(plugfile)
       endif
     endfor
   finally
@@ -359,13 +392,13 @@ function! s:update_serial(pull)
     for [name, spec] in items(todo)
       let done[name] = 1
       if isdirectory(spec.dir)
-        execute 'cd '.spec.dir
+        execute 'cd '.s:esc(spec.dir)
         let [valid, msg] = s:git_valid(spec, 0, 0)
         if valid
           let result = a:pull ?
-            \ system(
+            \ s:system(
             \ printf('git checkout -q %s 2>&1 && git pull origin %s 2>&1',
-            \   spec.branch, spec.branch)) : 'Already installed'
+            \   s:shellesc(spec.branch), s:shellesc(spec.branch))) : 'Already installed'
           let error = a:pull ? v:shell_error != 0 : 0
         else
           let result = msg
@@ -376,10 +409,11 @@ function! s:update_serial(pull)
           call mkdir(base, 'p')
         endif
         execute 'cd '.base
-        let d = shellescape(substitute(spec.dir, '[\/]\+$', '', ''))
-        let result = system(
+        let result = s:system(
               \ printf('git clone --recursive %s -b %s %s 2>&1',
-              \ shellescape(spec.uri), shellescape(spec.branch), d))
+              \ s:shellesc(spec.uri),
+              \ s:shellesc(spec.branch),
+              \ s:shellesc(substitute(spec.dir, '[\/]\+$', '', ''))))
         let error = v:shell_error != 0
       endif
       cd -
@@ -402,6 +436,10 @@ endfunction
 
 function! s:update_parallel(pull, threads)
   ruby << EOF
+  def esc arg
+    %["#{arg.gsub('"', '\"')}"]
+  end
+
   st    = Time.now
   require 'thread'
   require 'fileutils'
@@ -502,8 +540,10 @@ function! s:update_parallel(pull, threads)
           while pair = take1.call
             name = pair.first
             dir, uri, branch = pair.last.values_at *%w[dir uri branch]
+            branch = esc branch
             ok, result =
               if File.directory? dir
+                dir = esc dir
                 ret, data = bt.call "#{cd} #{dir} && git rev-parse --abbrev-ref HEAD 2>&1 && git config remote.origin.url"
                 current_uri = data.lines.to_a.last
                 if !ret
@@ -525,7 +565,7 @@ function! s:update_parallel(pull, threads)
                 end
               else
                 FileUtils.mkdir_p(base)
-                d = dir.sub(%r{[\\/]+$}, '')
+                d = esc dir.sub(%r{[\\/]+$}, '')
                 bt.call "#{cd} #{base} && git clone --recursive #{uri} -b #{branch} #{d} 2>&1"
               end
             log.call name, result, ok
@@ -557,6 +597,10 @@ function! s:dirpath(path)
   endif
 endfunction
 
+function! s:shellesc(arg)
+  return '"'.substitute(a:arg, '"', '\\"', 'g').'"'
+endfunction
+
 function! s:glob_dir(path)
   return map(filter(split(globpath(a:path, '**'), '\n'), 'isdirectory(v:val)'), 's:dirpath(v:val)')
 endfunction
@@ -580,12 +624,16 @@ function! s:format_message(ok, name, message)
   endif
 endfunction
 
+function! s:system(cmd)
+  return system(s:is_win ? '('.a:cmd.')' : a:cmd)
+endfunction
+
 function! s:git_valid(spec, check_branch, cd)
   let ret = 1
   let msg = 'OK'
   if isdirectory(a:spec.dir)
-    if a:cd | execute "cd " . a:spec.dir | endif
-    let result = split(system("git rev-parse --abbrev-ref HEAD 2>&1 && git config remote.origin.url"), '\n')
+    if a:cd | execute "cd " . s:esc(a:spec.dir) | endif
+    let result = split(s:system("git rev-parse --abbrev-ref HEAD 2>&1 && git config remote.origin.url"), '\n')
     let remote = result[-1]
     if v:shell_error != 0
       let msg = join([remote, "PlugClean required."], "\n")
@@ -624,6 +672,7 @@ function! s:clean(force)
     endif
     let cnt += 1
     call s:progress_bar(2, repeat('=', cnt), total)
+    normal! 2G
     redraw
   endfor
 
@@ -657,7 +706,7 @@ function! s:clean(force)
     if yes
       for dir in todo
         if isdirectory(dir)
-          call system((s:is_win ? 'rmdir /S /Q ' : 'rm -rf ') . dir)
+          call system((s:is_win ? 'rmdir /S /Q ' : 'rm -rf ') . s:shellesc(dir))
         endif
       endfor
       call append(line('$'), 'Removed.')
@@ -670,8 +719,8 @@ endfunction
 
 function! s:upgrade()
   if executable('curl')
-    let mee = shellescape(s:me)
-    let new = shellescape(s:me . '.new')
+    let mee = s:shellesc(s:me)
+    let new = s:shellesc(s:me . '.new')
     echo "Downloading ". s:plug_source
     redraw
     let mv = s:is_win ? 'move /Y' : 'mv -f'
@@ -713,22 +762,97 @@ endfunction
 function! s:status()
   call s:prepare()
   call append(0, 'Checking plugins')
+  call append(1, '')
 
   let ecnt = 0
+  let [cnt, total] = [0, len(g:plugs)]
   for [name, spec] in items(g:plugs)
     if isdirectory(spec.dir)
-      execute 'cd '.spec.dir
-      let [valid, msg] = s:git_valid(spec, 1, 0)
-      cd -
+      let [valid, msg] = s:git_valid(spec, 1, 1)
     else
       let [valid, msg] = [0, 'Not found. Try PlugInstall.']
     endif
+    let cnt += 1
     let ecnt += !valid
-    call append(2, s:format_message(valid, name, msg))
-    call cursor(3, 1)
+    call s:progress_bar(2, repeat('=', cnt), total)
+    call append(3, s:format_message(valid, name, msg))
+    normal! 2G
     redraw
   endfor
   call setline(1, 'Finished. '.ecnt.' error(s).')
+  normal! gg
+endfunction
+
+function! s:is_preview_window_open()
+  silent! wincmd P
+  if &previewwindow
+    wincmd p
+    return 1
+  endif
+  return 0
+endfunction
+
+function! s:preview_commit()
+  if b:plug_preview < 0
+    let b:plug_preview = !s:is_preview_window_open()
+  endif
+
+  let sha = matchstr(getline('.'), '\(^  \)\@<=[0-9a-z]\{7}')
+  if !empty(sha)
+    let lnum = line('.')
+    while lnum > 1
+      let lnum -= 1
+      let line = getline(lnum)
+      let name = matchstr(line, '\(^- \)\@<=[^:]\+')
+      if !empty(name)
+        let dir = g:plugs[name].dir
+        if isdirectory(dir)
+          execute 'cd '.s:esc(dir)
+          execute 'pedit '.sha
+          wincmd P
+          setlocal filetype=git buftype=nofile nobuflisted
+          execute 'silent read !git show '.sha
+          normal! ggdd
+          wincmd p
+          cd -
+        endif
+        break
+      endif
+    endwhile
+  endif
+endfunction
+
+function! s:section(flags)
+  call search('\(^- \)\@<=.', a:flags)
+endfunction
+
+function! s:diff()
+  call s:prepare()
+  call append(0, 'Collecting updated changes ...')
+  normal! gg
+  redraw
+
+  let cnt = 0
+  for [k, v] in items(g:plugs)
+    if !isdirectory(v.dir)
+      continue
+    endif
+
+    execute 'cd '.s:esc(v.dir)
+    let diff = system('git log --pretty=format:"%h %s (%cr)" "HEAD@{0}...HEAD@{1}"')
+    if !v:shell_error && !empty(diff)
+      call append(1, '')
+      call append(2, '- '.k.':')
+      call append(3, map(split(diff, '\n'), '"  ". v:val'))
+      let cnt += 1
+      normal! gg
+      redraw
+    endif
+    cd -
+  endfor
+
+  call setline(1, cnt == 0 ? 'No updates.' : 'Last update:')
+  nnoremap <silent> <buffer> <cr> :silent! call <SID>preview_commit()<cr>
   normal! gg
 endfunction
 

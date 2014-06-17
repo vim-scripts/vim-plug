@@ -58,6 +58,7 @@ set cpo&vim
 let s:plug_source = 'https://raw.github.com/junegunn/vim-plug/master/plug.vim'
 let s:plug_file = 'Plugfile'
 let s:plug_buf = -1
+let s:loaded = {}
 let s:is_win = has('win32') || has('win64')
 let s:me = expand('<sfile>:p')
 
@@ -102,6 +103,10 @@ function! plug#begin(...)
   return 1
 endfunction
 
+function! s:to_a(v)
+  return type(a:v) == 3 ? a:v : [a:v]
+endfunction
+
 function! plug#end()
   if !exists('g:plugs')
     echoerr 'Call plug#begin() first'
@@ -112,6 +117,13 @@ function! plug#end()
     let keys = keys(s:extend(keys))
   endwhile
 
+  if exists('#PlugLOD')
+    augroup PlugLOD
+      autocmd!
+    augroup END
+    augroup! PlugLOD
+  endif
+
   filetype off
   " we want to make sure the plugin directories are added to rtp in the same
   " order that they are registered with the Plug command. since the s:add_rtp
@@ -119,8 +131,13 @@ function! plug#end()
   " need to loop through the plugins in reverse
   for name in reverse(copy(g:plugs_order))
     let plug = g:plugs[name]
+    if !has_key(plug, 'on') && !has_key(plug, 'for')
+      call s:add_rtp(s:rtp(plug))
+      continue
+    endif
+
     if has_key(plug, 'on')
-      let commands = type(plug.on) == 1 ? [plug.on] : plug.on
+      let commands = s:to_a(plug.on)
       for cmd in commands
         if cmd =~ '^<Plug>.\+'
           if empty(mapcheck(cmd)) && empty(mapcheck(cmd, 'i'))
@@ -136,8 +153,16 @@ function! plug#end()
           \ cmd, string(cmd), string(plug))
         endif
       endfor
-    else
-      call s:add_rtp(s:rtp(plug))
+    endif
+
+    if has_key(plug, 'for')
+      for vim in split(globpath(s:rtp(plug), 'ftdetect/**/*.vim'), '\n')
+        execute 'source '.vim
+      endfor
+      augroup PlugLOD
+        execute printf('autocmd FileType %s call <SID>lod_ft(%s, %s)',
+              \ join(s:to_a(plug.for), ','), string(name), string(plug))
+      augroup END
     endif
   endfor
   filetype plugin indent on
@@ -163,26 +188,34 @@ function! s:add_rtp(rtp)
   endif
 endfunction
 
-function! s:lod(plug)
+function! s:lod(plug, types)
   let rtp = s:rtp(a:plug)
   call s:add_rtp(rtp)
-  for dir in ['plugin', 'after']
-    for vim in split(globpath(rtp, dir.'/*.vim'), '\n')
+  for dir in a:types
+    for vim in split(globpath(rtp, dir.'/**/*.vim'), '\n')
       execute 'source '.vim
     endfor
   endfor
 endfunction
 
+function! s:lod_ft(name, plug)
+  if has_key(s:loaded, a:name)
+    return
+  endif
+  call s:lod(a:plug, ['plugin', 'after'])
+  let s:loaded[a:name] = 1
+endfunction
+
 function! s:lod_cmd(cmd, bang, args, plug)
   execute 'delc '.a:cmd
-  call s:lod(a:plug)
+  call s:lod(a:plug, ['plugin', 'ftdetect', 'after'])
   execute printf("%s%s %s", a:cmd, a:bang, a:args)
 endfunction
 
 function! s:lod_map(map, plug)
   execute 'unmap '.a:map
   execute 'iunmap '.a:map
-  call s:lod(a:plug)
+  call s:lod(a:plug, ['plugin', 'ftdetect', 'after'])
   let extra = ''
   while 1
     let c = getchar(0)
@@ -397,7 +430,7 @@ function! s:update_serial(pull)
         if valid
           let result = a:pull ?
             \ s:system(
-            \ printf('git checkout -q %s 2>&1 && git pull origin %s 2>&1',
+            \ printf('git checkout -q %s 2>&1 && git pull origin %s 2>&1 && git submodule update --init --recursive 2>&1',
             \   s:shellesc(spec.branch), s:shellesc(spec.branch))) : 'Already installed'
           let error = a:pull ? v:shell_error != 0 : 0
         else
@@ -410,10 +443,11 @@ function! s:update_serial(pull)
         endif
         execute 'cd '.base
         let result = s:system(
-              \ printf('git clone --recursive %s -b %s %s 2>&1',
+              \ printf('git clone --recursive %s -b %s %s 2>&1 && cd %s && git submodule update --init --recursive 2>&1',
               \ s:shellesc(spec.uri),
               \ s:shellesc(spec.branch),
-              \ s:shellesc(substitute(spec.dir, '[\/]\+$', '', ''))))
+              \ s:shellesc(substitute(spec.dir, '[\/]\+$', '', '')),
+              \ s:shellesc(spec.dir)))
         let error = v:shell_error != 0
       endif
       cd -
@@ -558,7 +592,7 @@ function! s:update_parallel(pull, threads)
                            "PlugClean required."].join($/)]
                 else
                   if pull
-                    bt.call "#{cd} #{dir} && git checkout -q #{branch} 2>&1 && git pull origin #{branch} 2>&1"
+                    bt.call "#{cd} #{dir} && git checkout -q #{branch} 2>&1 && git pull origin #{branch} 2>&1 && git submodule update --init --recursive 2>&1"
                   else
                     [true, skip]
                   end
@@ -566,7 +600,7 @@ function! s:update_parallel(pull, threads)
               else
                 FileUtils.mkdir_p(base)
                 d = esc dir.sub(%r{[\\/]+$}, '')
-                bt.call "#{cd} #{base} && git clone --recursive #{uri} -b #{branch} #{d} 2>&1"
+                bt.call "#{cd} #{base} && git clone --recursive #{uri} -b #{branch} #{d} 2>&1 && cd #{esc dir} && git submodule update --init --recursive 2>&1"
               end
             log.call name, result, ok
           end

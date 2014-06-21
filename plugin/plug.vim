@@ -24,7 +24,7 @@
 " You can change the location of the plugins with plug#begin(path) call.
 "
 "
-" Copyright (c) 2013 Junegunn Choi
+" Copyright (c) 2014 Junegunn Choi
 "
 " MIT License
 "
@@ -92,9 +92,9 @@ function! plug#begin(...)
   " we want to keep track of the order plugins where registered.
   let g:plugs_order = []
 
-  command! -nargs=+ Plug        call s:add(1, <args>)
-  command! -nargs=* PlugInstall call s:install(<f-args>)
-  command! -nargs=* PlugUpdate  call s:update(<f-args>)
+  command! -nargs=+ -bar Plug   call s:add(1, <args>)
+  command! -nargs=* -complete=customlist,s:names PlugInstall call s:install(<f-args>)
+  command! -nargs=* -complete=customlist,s:names PlugUpdate  call s:update(<f-args>)
   command! -nargs=0 -bang PlugClean call s:clean('<bang>' == '!')
   command! -nargs=0 PlugUpgrade if s:upgrade() | execute "source ". s:me | endif
   command! -nargs=0 PlugStatus  call s:status()
@@ -125,6 +125,15 @@ function! plug#end()
   endif
 
   filetype off
+  if exists('#filetypeplugin') &&
+        \ !empty(filter(values(g:plugs), 'has_key(v:val, "for")'))
+    unlet! g:did_load_ftplugin
+    augroup filetypeplugin
+      autocmd!
+    augroup END
+    augroup! filetypeplugin
+  endif
+
   " we want to make sure the plugin directories are added to rtp in the same
   " order that they are registered with the Plug command. since the s:add_rtp
   " function uses ^= to add plugin directories to the front of the rtp, we
@@ -149,7 +158,7 @@ function! plug#end()
           endif
         elseif !exists(':'.cmd)
           execute printf(
-          \ "command! -nargs=* -bang %s call s:lod_cmd(%s, '<bang>', <q-args>, %s)",
+          \ "command! -nargs=* -range -bang %s call s:lod_cmd(%s, '<bang>', <line1>, <line2>, <q-args>, %s)",
           \ cmd, string(cmd), string(plug))
         endif
       endfor
@@ -206,10 +215,10 @@ function! s:lod_ft(name, plug)
   let s:loaded[a:name] = 1
 endfunction
 
-function! s:lod_cmd(cmd, bang, args, plug)
+function! s:lod_cmd(cmd, bang, l1, l2, args, plug)
   execute 'delc '.a:cmd
   call s:lod(a:plug, ['plugin', 'ftdetect', 'after'])
-  execute printf("%s%s %s", a:cmd, a:bang, a:args)
+  execute printf("%s%s%s %s", (a:l1 == a:l2 ? '' : (a:l1.','.a:l2)), a:cmd, a:bang, a:args)
 endfunction
 
 function! s:lod_map(map, plug)
@@ -372,19 +381,35 @@ function! s:finish(pull)
   endif
 endfunction
 
-function! s:update_impl(pull, args)
-  let threads = len(a:args) > 0 ? a:args[0] : get(g:, 'plug_threads', 16)
+function! s:names(...)
+  return filter(keys(g:plugs), 'stridx(v:val, a:1) == 0')
+endfunction
+
+function! s:update_impl(pull, args) abort
+  let args = copy(a:args)
+  let threads = (len(args) > 0 && args[-1] =~ '^[1-9][0-9]*$') ?
+                  \ remove(args, -1) : get(g:, 'plug_threads', 16)
+
+  let todo = empty(args) ? g:plugs :
+                \ filter(copy(g:plugs), 'index(args, v:key) >= 0')
+
+  if empty(todo)
+    echohl WarningMsg
+    echo 'No plugin to '. (a:pull ? 'update' : 'install') . '.'
+    echohl None
+    return
+  endif
 
   call s:prepare()
   call append(0, a:pull ? 'Updating plugins' : 'Installing plugins')
-  call append(1, '['. s:lpad('', len(g:plugs)) .']')
+  call append(1, '['. s:lpad('', len(todo)) .']')
   normal! 2G
   redraw
 
   if has('ruby') && threads > 1
-    call s:update_parallel(a:pull, threads)
+    call s:update_parallel(a:pull, todo, threads)
   else
-    call s:update_serial(a:pull)
+    call s:update_serial(a:pull, todo)
   endif
   call s:finish(a:pull)
 endfunction
@@ -413,10 +438,10 @@ function! s:update_progress(pull, cnt, bar, total)
   redraw
 endfunction
 
-function! s:update_serial(pull)
+function! s:update_serial(pull, todo)
   let st    = reltime()
   let base  = g:plug_home
-  let todo  = copy(g:plugs)
+  let todo  = copy(a:todo)
   let total = len(todo)
   let done  = {}
   let bar   = ''
@@ -468,7 +493,7 @@ function! s:update_serial(pull)
   call setline(1, "Updated. Elapsed time: " . split(reltimestr(reltime(st)))[0] . ' sec.')
 endfunction
 
-function! s:update_parallel(pull, threads)
+function! s:update_parallel(pull, todo, threads)
   ruby << EOF
   def esc arg
     %["#{arg.gsub('"', '\"')}"]
@@ -482,7 +507,7 @@ function! s:update_parallel(pull, threads)
   iswin = VIM::evaluate('s:is_win').to_i == 1
   pull  = VIM::evaluate('a:pull').to_i == 1
   base  = VIM::evaluate('g:plug_home')
-  all   = VIM::evaluate('copy(g:plugs)')
+  all   = VIM::evaluate('copy(a:todo)')
   limit = VIM::evaluate('get(g:, "plug_timeout", 60)')
   nthr  = VIM::evaluate('a:threads').to_i
   cd    = iswin ? 'cd /d' : 'cd'
@@ -494,7 +519,7 @@ function! s:update_parallel(pull, threads)
   take1 = proc { mtx.synchronize { running && all.shift } }
   logh  = proc {
     cnt = done.length
-    tot = VIM::evaluate('len(g:plugs)') || tot
+    tot = VIM::evaluate('len(a:todo)') || tot
     $curbuf[1] = "#{pull ? 'Updating' : 'Installing'} plugins (#{cnt}/#{tot})"
     $curbuf[2] = '[' + bar.ljust(tot) + ']'
     VIM::command('normal! 2G')

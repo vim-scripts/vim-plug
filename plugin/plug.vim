@@ -406,10 +406,14 @@ function! s:update_impl(pull, args) abort
   normal! 2G
   redraw
 
+  let len = len(g:plugs)
   if has('ruby') && threads > 1
     call s:update_parallel(a:pull, todo, threads)
   else
     call s:update_serial(a:pull, todo)
+  endif
+  if len(g:plugs) > len
+    call plug#end()
   endif
   call s:finish(a:pull)
 endfunction
@@ -687,6 +691,11 @@ function! s:system(cmd)
   return system(s:is_win ? '('.a:cmd.')' : a:cmd)
 endfunction
 
+function! s:system_chomp(str)
+  let ret = s:system(a:str)
+  return v:shell_error ? '' : substitute(ret, '\n$', '', '')
+endfunction
+
 function! s:git_valid(spec, check_branch, cd)
   let ret = 1
   let msg = 'OK'
@@ -694,7 +703,7 @@ function! s:git_valid(spec, check_branch, cd)
     if a:cd | execute "cd " . s:esc(a:spec.dir) | endif
     let result = split(s:system("git rev-parse --abbrev-ref HEAD 2>&1 && git config remote.origin.url"), '\n')
     let remote = result[-1]
-    if v:shell_error != 0
+    if v:shell_error
       let msg = join([remote, "PlugClean required."], "\n")
       let ret = 0
     elseif !s:compare_git_uri(remote, a:spec.uri)
@@ -704,9 +713,13 @@ function! s:git_valid(spec, check_branch, cd)
       let ret = 0
     elseif a:check_branch
       let branch = result[0]
-      if a:spec.branch != branch
-        let msg = 'Invalid branch: '.branch.'. Try PlugUpdate.'
-        let ret = 0
+      if a:spec.branch !=# branch
+        let tag = s:system_chomp('git describe --exact-match --tags HEAD 2>&1')
+        if a:spec.branch !=# tag
+          let msg = printf('Invalid branch/tag: %s (expected: %s). Try PlugUpdate.',
+                \ (empty(tag) ? branch : tag), a:spec.branch)
+          let ret = 0
+        endif
       endif
     endif
     if a:cd | cd - | endif

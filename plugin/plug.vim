@@ -141,16 +141,17 @@ function! plug#end()
       for cmd in commands
         if cmd =~ '^<Plug>.\+'
           if empty(mapcheck(cmd)) && empty(mapcheck(cmd, 'i'))
-            for [mode, prefix] in [['i', "<C-O>"], ['', '']]
+            for [mode, map_prefix, key_prefix] in
+                  \ [['i', "<C-O>", ''], ['n', '', ''], ['v', '', 'gv'], ['o', '', '']]
               execute printf(
-              \ "%snoremap <silent> %s %s:call <SID>lod_map(%s, %s)<CR>",
-              \ mode, cmd, prefix, string(cmd), string(plug))
+              \ "%snoremap <silent> %s %s:<C-U>call <SID>lod_map(%s, %s, '%s')<CR>",
+              \ mode, cmd, map_prefix, string(cmd), string(name), key_prefix)
             endfor
           endif
         elseif !exists(':'.cmd)
           execute printf(
           \ "command! -nargs=* -range -bang %s call s:lod_cmd(%s, '<bang>', <line1>, <line2>, <q-args>, %s)",
-          \ cmd, string(cmd), string(plug))
+          \ cmd, string(cmd), string(name))
         endif
       endfor
     endif
@@ -178,13 +179,32 @@ function! plug#end()
   syntax on
 endfunction
 
-function! s:rtp(spec)
-  let rtp = s:dirpath(a:spec.dir . get(a:spec, 'rtp', ''))
-  if s:is_win
-    let rtp = substitute(rtp, '\\*$', '', '')
-  endif
-  return rtp
-endfunction
+if s:is_win
+  function! s:rtp(spec)
+    let rtp = s:dirpath(a:spec.dir . get(a:spec, 'rtp', ''))
+    return substitute(rtp, '\\*$', '', '')
+  endfunction
+
+  function! s:path(path)
+    return substitute(substitute(a:path, '/', '\', 'g'), '[/\\]*$', '', '')
+  endfunction
+
+  function! s:dirpath(path)
+    return s:path(a:path) . '\'
+  endfunction
+else
+  function! s:rtp(spec)
+    return s:dirpath(a:spec.dir . get(a:spec, 'rtp', ''))
+  endfunction
+
+  function! s:path(path)
+    return substitute(a:path, '[/\\]*$', '', '')
+  endfunction
+
+  function! s:dirpath(path)
+    return s:path(a:path) . '/'
+  endfunction
+endif
 
 function! s:esc(path)
   return substitute(a:path, ' ', '\\ ', 'g')
@@ -192,8 +212,9 @@ endfunction
 
 function! s:add_rtp(rtp)
   execute "set rtp^=".s:esc(a:rtp)
-  if isdirectory(a:rtp.'after')
-    execute "set rtp+=".s:esc(a:rtp.'after')
+  let after = globpath(a:rtp, 'after')
+  if isdirectory(after)
+    execute "set rtp+=".s:esc(after)
   endif
 endfunction
 
@@ -212,19 +233,19 @@ function! s:lod_ft(pat, names)
     call s:lod(g:plugs[name], ['plugin', 'after'])
   endfor
   execute 'autocmd! PlugLOD FileType ' . a:pat
-  let &l:filetype = &l:filetype
+  silent! doautocmd filetypeplugin FileType
 endfunction
 
-function! s:lod_cmd(cmd, bang, l1, l2, args, plug)
+function! s:lod_cmd(cmd, bang, l1, l2, args, name)
   execute 'delc '.a:cmd
-  call s:lod(a:plug, ['plugin', 'ftdetect', 'after'])
+  call s:lod(g:plugs[a:name], ['plugin', 'ftdetect', 'after'])
   execute printf("%s%s%s %s", (a:l1 == a:l2 ? '' : (a:l1.','.a:l2)), a:cmd, a:bang, a:args)
 endfunction
 
-function! s:lod_map(map, plug)
+function! s:lod_map(map, name, prefix)
   execute 'unmap '.a:map
   execute 'iunmap '.a:map
-  call s:lod(a:plug, ['plugin', 'ftdetect', 'after'])
+  call s:lod(g:plugs[a:name], ['plugin', 'ftdetect', 'after'])
   let extra = ''
   while 1
     let c = getchar(0)
@@ -233,7 +254,7 @@ function! s:lod_map(map, plug)
     endif
     let extra .= nr2char(c)
   endwhile
-  call feedkeys(substitute(a:map, '^<Plug>', "\<Plug>", '') . extra)
+  call feedkeys(a:prefix . substitute(a:map, '^<Plug>', "\<Plug>", '') . extra)
 endfunction
 
 function! s:add(...)
@@ -256,6 +277,9 @@ function! s:add(...)
     return
   endif
 
+  let name = substitute(split(plugin, '/')[-1], '\.git$', '', '')
+  if !force && has_key(g:plugs, name) | return | endif
+
   if plugin =~ ':'
     let uri = plugin
   else
@@ -264,9 +288,6 @@ function! s:add(...)
     endif
     let uri = 'https://git:@github.com/' . plugin . '.git'
   endif
-
-  let name = substitute(split(plugin, '/')[-1], '\.git$', '', '')
-  if !force && has_key(g:plugs, name) | return | endif
 
   let dir  = s:dirpath( fnamemodify(join([g:plug_home, name], '/'), ':p') )
   let spec = extend(opts, { 'dir': dir, 'uri': uri })
@@ -423,7 +444,7 @@ function! s:extend(names)
   try
     command! -nargs=+ Plug call s:add(0, <args>)
     for name in a:names
-      let plugfile = s:rtp(g:plugs[name]) . s:plug_file
+      let plugfile = globpath(s:rtp(g:plugs[name]), s:plug_file)
       if filereadable(plugfile)
         execute "source ". s:esc(plugfile)
       endif
@@ -644,20 +665,6 @@ function! s:update_parallel(pull, todo, threads)
   watcher.kill
   $curbuf[1] = "Updated. Elapsed time: #{"%.6f" % (Time.now - st)} sec."
 EOF
-endfunction
-
-function! s:path(path)
-  return substitute(s:is_win ? substitute(a:path, '/', '\', 'g') : a:path,
-        \ '[/\\]*$', '', '')
-endfunction
-
-function! s:dirpath(path)
-  let path = s:path(a:path)
-  if s:is_win
-    return path !~ '\\$' ? path.'\' : path
-  else
-    return path !~ '/$' ? path.'/' : path
-  endif
 endfunction
 
 function! s:shellesc(arg)
